@@ -1120,7 +1120,31 @@ int print_dwarf_symbol(Dwarf_Debug dbg, Dwarf_Addr slide, Dwarf_Addr addr)
         }
     }
 
-    dwarf_dealloc(dbg, arange, DW_DLA_ARANGE);
+    /*
+     * We should not free arange memory here, because calling dwarf_get_arange with different addr multi times may return the same arange,
+     * it will lead to use freed memory (segmentation fault) if this arange has been freed before.
+     * See below the Valgrind analysis:
+     *
+     *   ==10206== Invalid read of size 8
+     *   ==10206==    at 0x408519: dwarf_get_arange (dwarf_arange.c:505)
+     *   ==10206==    by 0x403D4B: print_dwarf_symbol (atosl.c:1017)
+     *   ==10206==    by 0x404A37: main (atosl.c:1299)
+     *   ==10206==  Address 0x5d344d8 is 24 bytes inside a block of size 64 free'd
+     *   ==10206==    at 0x4C2B06D: free (vg_replace_malloc.c:540)
+     *   ==10206==    by 0x406CA2: dwarf_dealloc (dwarf_alloc.c:587)
+     *   ==10206==    by 0x404296: print_dwarf_symbol (atosl.c:1119)
+     *   ==10206==    by 0x404A37: main (atosl.c:1299)
+     *   ==10206==  Block was alloc'd at
+     *   ==10206==    at 0x4C29F73: malloc (vg_replace_malloc.c:309)
+     *   ==10206==    by 0x406A0A: _dwarf_get_alloc (dwarf_alloc.c:416)
+     *   ==10206==    by 0x407E61: dwarf_get_aranges_list (dwarf_arange.c:253)
+     *   ==10206==    by 0x40814E: dwarf_get_aranges (dwarf_arange.c:370)
+     *   ==10206==    by 0x403CE6: print_dwarf_symbol (atosl.c:1013)
+     *   ==10206==    by 0x404A37: main (atosl.c:1299)
+     *
+     * Todo: consider to free arange after all addresses have been resolved
+     */
+//    dwarf_dealloc(dbg, arange, DW_DLA_ARANGE)
     dwarf_srclines_dealloc(dbg, linebuf, linecount);
 
     return found ? DW_DLV_OK : DW_DLV_NO_ENTRY;
