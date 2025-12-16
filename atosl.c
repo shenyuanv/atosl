@@ -1037,66 +1037,6 @@ cleanup:
     return -1;
 }
 
-/* Read and display Objective-C method names from __objc_methname section */
-void dump_objc_methname_section(int fd)
-{
-    if (context.objc_methname_size == 0 || context.objc_methname_offset == 0)
-        return;
-    
-    if (!debug)
-        return;
-    
-    char *methname_data = malloc(context.objc_methname_size);
-    if (!methname_data)
-        fatal("unable to allocate memory for objc_methname");
-    
-    off_t pos = lseek(fd, 0, SEEK_CUR);
-    if (pos < 0)
-        fatal("error seeking: %s", strerror(errno));
-    
-    int ret = lseek(fd, context.arch.offset + context.objc_methname_offset, SEEK_SET);
-    if (ret < 0)
-        fatal("error seeking to objc_methname: %s", strerror(errno));
-    
-    ret = _read(fd, methname_data, context.objc_methname_size);
-    if (ret < 0)
-        fatal_file(fd);
-    
-    ret = lseek(fd, pos, SEEK_SET);
-    if (ret < 0)
-        fatal("error seeking back: %s", strerror(errno));
-    
-    fprintf(stderr, "\n=== Objective-C Method Names (__objc_methname section) ===\n");
-    fprintf(stderr, "Section addr: 0x%llx, size: 0x%llx, offset: %llu\n",
-            (unsigned long long)context.objc_methname_addr,
-            (unsigned long long)context.objc_methname_size,
-            (unsigned long long)context.objc_methname_offset);
-    
-    /* Method names are null-terminated strings */
-    char *p = methname_data;
-    char *end = methname_data + context.objc_methname_size;
-    int count = 0;
-    
-    while (p < end) {
-        size_t len = strnlen(p, end - p);
-        if (len > 0 && len < (end - p)) {
-            fprintf(stderr, "  %s\n", p);
-            count++;
-            p += len + 1;
-        } else {
-            /* Skip null bytes */
-            if (*p == '\0') {
-                p++;
-            } else {
-                break;
-            }
-        }
-    }
-    
-    fprintf(stderr, "Total method names found: %d\n", count);
-    
-    free(methname_data);
-}
 
 /* Find Objective-C method for given address */
 static const struct objc_method_t *find_objc_method(Dwarf_Addr addr)
@@ -1333,13 +1273,6 @@ int  find_and_print_symtab_symbol(Dwarf_Addr slide, Dwarf_Addr addr)
             }
         }
         
-        /* Check if the address is in a large gap that might contain Objective-C methods */
-        int might_be_objc_method = 0;
-        if (has_next && (next_addr - best_addr) > 0x1000) {
-            /* Large gap - might contain Objective-C methods */
-            might_be_objc_method = 1;
-        }
-        
         if (debug) {
             fprintf(stderr, "=== Symbol Match Result ===\n");
             fprintf(stderr, "Found symbol: %s\n", best_match->name);
@@ -1356,20 +1289,6 @@ int  find_and_print_symtab_symbol(Dwarf_Addr slide, Dwarf_Addr addr)
                     (unsigned long long)(addr - best_addr));
             fprintf(stderr, "Section: %d, Type: 0x%02x\n", best_match->n_sect, best_match->n_type);
             
-            /* Check if this might be an Objective-C method call */
-            if (context.objc_methname_size > 0) {
-                fprintf(stderr, "\nNOTE: Objective-C methods are not stored in the symbol table.\n");
-                fprintf(stderr, "The symbol table only contains C/C++ functions and class symbols.\n");
-                fprintf(stderr, "Objective-C method names are stored in __objc_methname section\n");
-                fprintf(stderr, "(addr=0x%llx, size=0x%llx).\n",
-                        (unsigned long long)context.objc_methname_addr,
-                        (unsigned long long)context.objc_methname_size);
-                if (might_be_objc_method) {
-                    fprintf(stderr, "\nWARNING: Large gap between symbols (0x%llx bytes).\n",
-                            (unsigned long long)(next_addr - best_addr));
-                    fprintf(stderr, "This address might be in an Objective-C method implementation.\n");
-                }
-            }
         }
         
         
@@ -2038,27 +1957,14 @@ int main(int argc, char *argv[]) {
     if (argc <= optind)
         fatal_usage("no addresses specified");
 
-    if (debug) {
-        fprintf(stderr, "DEBUG: About to call dwarf_mach_object_access_init\n");
-        fflush(stderr);
-    }
+
     
     dwarf_mach_object_access_init(fd, &binary_interface, &derr);
     assert(binary_interface);
     
-    if (debug) {
-        fprintf(stderr, "DEBUG: After dwarf_mach_object_access_init\n");
-        fflush(stderr);
-    }
+
     
-    /* Dump Objective-C method names if available and in debug mode */
-    if (debug && context.objc_methname_size > 0) {
-        fprintf(stderr, "\n=== CHECKING FOR OBJECTIVE-C METHOD NAMES ===\n");
-        fprintf(stderr, "objc_methname_size: 0x%llx\n", (unsigned long long)context.objc_methname_size);
-        fprintf(stderr, "objc_methname_offset: %llu\n", (unsigned long long)context.objc_methname_offset);
-        fprintf(stderr, "Calling dump_objc_methname_section...\n");
-        dump_objc_methname_section(fd);
-    }
+
     
     /* Parse Objective-C methods and sort by address for symbolication */
     parse_objc_methods(fd);
