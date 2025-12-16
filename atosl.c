@@ -38,6 +38,27 @@
         } \
     } while (0);
 
+/* Objective-C method list structure constants */
+#define OBJC_METHOD_LIST_HEADER_SIZE 8  /* entsizeAndFlags (4) + count (4) */
+#define OBJC_METHOD_T_FIELD_SIZE 4      /* Size of each 32-bit field in method_t */
+#define OBJC_METHOD_T_MIN_SIZE 12       /* Minimum size: name(4) + types(4) + imp(4) */
+#define OBJC_METHOD_T_NAME_OFFSET 0     /* Offset of name field in method_t */
+#define OBJC_METHOD_T_TYPES_OFFSET 4    /* Offset of types field in method_t */
+#define OBJC_METHOD_T_IMP_OFFSET 8      /* Offset of imp field in method_t */
+
+/* Objective-C method parsing limits and constants */
+#define OBJC_METHOD_ARRAY_INITIAL_SIZE 200      /* Initial allocation size for method array */
+#define OBJC_METHOD_ARRAY_REALLOC_INCREMENT 100 /* Reallocation increment */
+#define OBJC_METHOD_ARRAY_MAX_SIZE 200          /* Maximum methods to parse per list */
+#define OBJC_METHOD_ENTSIZE_MAX 100             /* Maximum valid entsize value */
+#define OBJC_METHOD_COUNT_MAX 1000              /* Maximum valid method count */
+#define OBJC_DEBUG_METHOD_DUMP_LIMIT 3          /* Number of methods to dump raw bytes for */
+#define OBJC_DEBUG_METHOD_OUTPUT_LIMIT 10       /* Number of methods to output in debug */
+#define OBJC_SEL_POINTER_SIZE 8                 /* Size of SEL pointer (64-bit) */
+#define OBJC_ADDRESS_RANGE_CHECK 0x20000        /* 128KB range for address validation */
+#define OBJC_METHNAME_BOUNDS_TOLERANCE 100      /* Tolerance for bounds checking */
+#define OBJC_DEBUG_NEARBY_SYMBOLS_WINDOW 10     /* Number of nearby symbols to show in debug */
+
 extern char *
 cplus_demangle (const char *mangled, int options);
 
@@ -90,6 +111,8 @@ struct symbol_t {
         struct nlist_64 sym64;
     } sym;
     Dwarf_Addr addr;
+    uint8_t n_type;
+    uint8_t n_sect;
     int thumb:1;
 };
 
@@ -145,6 +168,28 @@ static struct {
     uint8_t uuid[UUID_LEN];
     uint8_t is_64;
     uint8_t is_dwarf;
+    
+    /* Objective-C method name section */
+    Dwarf_Addr objc_methname_addr;
+    Dwarf_Addr objc_methname_size;
+    Dwarf_Addr objc_methname_offset;
+    
+    /* Objective-C selector references section */
+    Dwarf_Addr objc_selrefs_addr;
+    Dwarf_Addr objc_selrefs_size;
+    Dwarf_Addr objc_selrefs_offset;
+    
+    /* Objective-C method list section */
+    Dwarf_Addr objc_methlist_addr;
+    Dwarf_Addr objc_methlist_size;
+    Dwarf_Addr objc_methlist_offset;
+    
+    /* Objective-C method implementations mapped to names */
+    struct objc_method_t {
+        const char *name;
+        Dwarf_Addr imp_addr;  /* Implementation address */
+    } *objc_methods;
+    int objc_method_count;
 } context;
 
 typedef struct {
@@ -253,6 +298,29 @@ int parse_section(dwarf_mach_object_access_internals_t *obj)
         fprintf(stderr, "%10s %d\n", "reserved1", s->mach_section.reserved1);
         fprintf(stderr, "%10s %d\n", "reserved2", s->mach_section.reserved2);
     }
+    
+    /* Track Objective-C method name section for potential future use */
+    /* Use strncmp because section names are 16 bytes and may be null-padded */
+    if (strncmp(s->mach_section.sectname, "__objc_methname", 16) == 0) {
+        context.objc_methname_addr = s->mach_section.addr;
+        context.objc_methname_size = s->mach_section.size;
+        context.objc_methname_offset = s->mach_section.offset;
+        if (debug) {
+            fprintf(stderr, "*** Found __objc_methname section: addr=0x%x, size=0x%x, offset=%d ***\n",
+                    s->mach_section.addr, s->mach_section.size, s->mach_section.offset);
+        }
+    }
+    
+    /* Track Objective-C selector references section */
+    if (strncmp(s->mach_section.sectname, "__objc_selrefs", 16) == 0) {
+        context.objc_selrefs_addr = s->mach_section.addr;
+        context.objc_selrefs_size = s->mach_section.size;
+        context.objc_selrefs_offset = s->mach_section.offset;
+        if (debug) {
+            fprintf(stderr, "*** Found __objc_selrefs section: addr=0x%x, size=0x%x, offset=%d ***\n",
+                    s->mach_section.addr, s->mach_section.size, s->mach_section.offset);
+        }
+    }
 
     struct dwarf_section_t *sec = obj->sections;
     if (!sec)
@@ -303,6 +371,46 @@ int parse_section_64(dwarf_mach_object_access_internals_t *obj)
         fprintf(stderr, "%10s %d\n", "reserved1", s->mach_section.reserved1);
         fprintf(stderr, "%10s %d\n", "reserved2", s->mach_section.reserved2);
         fprintf(stderr, "%10s %d\n", "reserved3", s->mach_section.reserved3);
+    }
+    
+    /* Track Objective-C method name section for potential future use */
+    /* Use strncmp because section names are 16 bytes and may be null-padded */
+    if (strncmp(s->mach_section.sectname, "__objc_methname", 16) == 0) {
+        context.objc_methname_addr = s->mach_section.addr;
+        context.objc_methname_size = s->mach_section.size;
+        context.objc_methname_offset = s->mach_section.offset;
+        if (debug) {
+            fprintf(stderr, "*** FOUND __objc_methname section: addr=0x%llx, size=0x%llx, offset=%d ***\n",
+                    (unsigned long long)s->mach_section.addr, 
+                    (unsigned long long)s->mach_section.size, 
+                    s->mach_section.offset);
+        }
+    }
+    
+    /* Track Objective-C method list section */
+    if (strncmp(s->mach_section.sectname, "__objc_methlist", 16) == 0) {
+        context.objc_methlist_addr = s->mach_section.addr;
+        context.objc_methlist_size = s->mach_section.size;
+        context.objc_methlist_offset = s->mach_section.offset;
+        if (debug) {
+            fprintf(stderr, "*** FOUND __objc_methlist section: addr=0x%llx, size=0x%llx, offset=%d ***\n",
+                    (unsigned long long)s->mach_section.addr, 
+                    (unsigned long long)s->mach_section.size, 
+                    s->mach_section.offset);
+        }
+    }
+    
+    /* Track Objective-C selector references section */
+    if (strncmp(s->mach_section.sectname, "__objc_selrefs", 16) == 0) {
+        context.objc_selrefs_addr = s->mach_section.addr;
+        context.objc_selrefs_size = s->mach_section.size;
+        context.objc_selrefs_offset = s->mach_section.offset;
+        if (debug) {
+            fprintf(stderr, "*** FOUND __objc_selrefs section: addr=0x%llx, size=0x%llx, offset=%d ***\n",
+                    (unsigned long long)s->mach_section.addr, 
+                    (unsigned long long)s->mach_section.size, 
+                    s->mach_section.offset);
+        }
     }
 
     struct dwarf_section_64_t *sec = obj->sections_64;
@@ -487,7 +595,11 @@ static int compare_symbols(const void *a, const void *b)
 {
     struct symbol_t *sym_a = (struct symbol_t *)a;
     struct symbol_t *sym_b = (struct symbol_t *)b;
-    return sym_a->addr - sym_b->addr;
+    if (sym_a->addr < sym_b->addr)
+        return -1;
+    if (sym_a->addr > sym_b->addr)
+        return 1;
+    return 0;
 }
 
 void print_symbol(const char *symbol, unsigned offset)
@@ -558,6 +670,461 @@ int handle_stabs_symbol(int is_fun_stab, Dwarf_Addr search_addr, const struct sy
     return 0;
 }
 
+/* Compare Objective-C methods by address for binary search */
+static int compare_objc_methods(const void *a, const void *b)
+{
+    const struct objc_method_t *meth_a = (const struct objc_method_t *)a;
+    const struct objc_method_t *meth_b = (const struct objc_method_t *)b;
+    if (meth_a->imp_addr < meth_b->imp_addr)
+        return -1;
+    if (meth_a->imp_addr > meth_b->imp_addr)
+        return 1;
+    return 0;
+}
+
+/* Parse Objective-C method list and map implementations to method names */
+int parse_objc_methods(int fd)
+{
+    if (context.objc_methlist_size == 0 || context.objc_methlist_offset == 0 ||
+        context.objc_methname_size == 0 || context.objc_methname_offset == 0)
+        return -1;
+    
+    /* For relative method lists, we also need __objc_selrefs section to dereference SELs */
+    int have_selrefs = (context.objc_selrefs_size > 0 && context.objc_selrefs_offset > 0);
+    
+    /* Read method name section */
+    char *methname_data = malloc(context.objc_methname_size);
+    if (!methname_data)
+        fatal("unable to allocate memory for objc_methname");
+    
+    off_t pos = lseek(fd, 0, SEEK_CUR);
+    if (pos < 0)
+        fatal("error seeking: %s", strerror(errno));
+    
+    int ret = lseek(fd, context.arch.offset + context.objc_methname_offset, SEEK_SET);
+    if (ret < 0)
+        fatal("error seeking to objc_methname: %s", strerror(errno));
+    
+    ret = _read(fd, methname_data, context.objc_methname_size);
+    if (ret < 0)
+        fatal_file(fd);
+    
+    /* Read selector references section if available */
+    uint8_t *selrefs_data = NULL;
+    if (have_selrefs) {
+        selrefs_data = malloc(context.objc_selrefs_size);
+        if (!selrefs_data)
+            fatal("unable to allocate memory for objc_selrefs");
+        
+        ret = lseek(fd, context.arch.offset + context.objc_selrefs_offset, SEEK_SET);
+        if (ret < 0)
+            fatal("error seeking to objc_selrefs: %s", strerror(errno));
+        
+        ret = _read(fd, selrefs_data, context.objc_selrefs_size);
+        if (ret < 0)
+            fatal_file(fd);
+    }
+    
+    /* Read method list section */
+    uint8_t *methlist_data = malloc(context.objc_methlist_size);
+    if (!methlist_data)
+        fatal("unable to allocate memory for objc_methlist");
+    
+    ret = lseek(fd, context.arch.offset + context.objc_methlist_offset, SEEK_SET);
+    if (ret < 0)
+        fatal("error seeking to objc_methlist: %s", strerror(errno));
+    
+    ret = _read(fd, methlist_data, context.objc_methlist_size);
+    if (ret < 0)
+        fatal_file(fd);
+    
+    ret = lseek(fd, pos, SEEK_SET);
+    if (ret < 0)
+        fatal("error seeking back: %s", strerror(errno));
+    
+    /* Parse method_list_t structure */
+    /* Format: uint32_t entsizeAndFlags, uint32_t count, then method_t entries */
+    /* The __objc_methlist section may contain multiple method lists */
+    uint8_t *p = methlist_data;
+    uint8_t *end = methlist_data + context.objc_methlist_size;
+    
+    if (context.objc_methlist_size < OBJC_METHOD_LIST_HEADER_SIZE)
+        goto cleanup;
+    
+    /* Allocate method array with reasonable initial size */
+    context.objc_methods = malloc(sizeof(struct objc_method_t) * OBJC_METHOD_ARRAY_INITIAL_SIZE);
+    if (!context.objc_methods)
+        fatal("unable to allocate memory for objc_methods");
+    
+    context.objc_method_count = 0;
+    
+    /* Parse method lists until we run out of data */
+    /* Note: __objc_methlist typically contains a single method_list_t structure */
+    while (p + OBJC_METHOD_LIST_HEADER_SIZE <= end && context.objc_method_count < OBJC_METHOD_ARRAY_MAX_SIZE) {
+        uint32_t entsizeAndFlags = *(uint32_t*)p;
+        p += OBJC_METHOD_T_FIELD_SIZE;
+        uint32_t count = *(uint32_t*)p;
+        p += OBJC_METHOD_T_FIELD_SIZE;
+        
+        /* Extract entsize (mask out flags - low 2 bits are flags, high bit might also be a flag) */
+        /* In some Objective-C runtime versions, the high bit indicates small method list format */
+        uint32_t entsize = entsizeAndFlags & 0x7FFFFFFC; /* Mask out low 2 bits and high bit */
+        
+        if (debug && context.objc_method_count == 0) {
+            fprintf(stderr, "\n=== Parsing Objective-C Method List ===\n");
+            fprintf(stderr, "entsizeAndFlags: 0x%x, entsize: %u, count: %u\n", 
+                    entsizeAndFlags, entsize, count);
+        }
+        
+        /* Validate entsize and count */
+        if (entsize == 0 || entsize > OBJC_METHOD_ENTSIZE_MAX || count == 0 || count > OBJC_METHOD_COUNT_MAX) {
+            if (debug)
+                fprintf(stderr, "Invalid method list (entsize=%u, count=%u), stopping\n", entsize, count);
+            break; /* Stop parsing if we hit invalid data */
+        }
+        
+        /* Check if we have enough space for this method list */
+        if (p + (entsize * count) > end) {
+            if (debug)
+                fprintf(stderr, "Method list extends beyond section, truncating\n");
+            break;
+        }
+        
+        if (debug) {
+            fprintf(stderr, "Parsing method list: %u methods, entsize=%u, remaining bytes=%zu\n",
+                    count, entsize, (size_t)(end - p));
+        }
+        
+        /* Parse each method entry in this method list */
+        for (uint32_t i = 0; i < count; i++) {
+            /* Check if we need to reallocate the method array */
+            if (context.objc_method_count >= OBJC_METHOD_ARRAY_INITIAL_SIZE) {
+                /* Reallocate with more space */
+                struct objc_method_t *new_methods = realloc(context.objc_methods, 
+                    sizeof(struct objc_method_t) * (context.objc_method_count + OBJC_METHOD_ARRAY_REALLOC_INCREMENT));
+                if (!new_methods)
+                    fatal("unable to reallocate memory for objc_methods");
+                context.objc_methods = new_methods;
+            }
+            
+            /* Check bounds */
+            if (p + entsize > end) {
+                if (debug)
+                    fprintf(stderr, "Method entry %u extends beyond section, stopping\n", i);
+                break;
+            }
+            
+            Dwarf_Addr name_offset = 0;
+            Dwarf_Addr imp_addr = 0;
+            
+            /* Parse method_t structure */
+            /* Structure: name_offset (32-bit), types_offset (32-bit), imp (32-bit) */
+            /* entsize=12 means: name(4) + types(4) + imp(4) = 12 bytes (all 32-bit, even imp on 64-bit!) */
+            /* This is a "small" or "relative" method list format where offsets might be relative */
+            if (entsize >= OBJC_METHOD_T_MIN_SIZE && p + entsize <= end) {
+                /* Debug: dump raw bytes for first few methods */
+                if (debug && i < OBJC_DEBUG_METHOD_DUMP_LIMIT) {
+                    fprintf(stderr, "Method %u raw bytes: ", i);
+                    for (int j = 0; j < OBJC_METHOD_T_MIN_SIZE && (p + j) < end; j++) {
+                        fprintf(stderr, "%02x ", p[j]);
+                    }
+                    fprintf(stderr, "\n");
+                    fprintf(stderr, "Method %u entry at offset 0x%lx from method list start\n", 
+                            i, (unsigned long)(p - methlist_data));
+                }
+                
+                /* Save pointer to start of this method entry for relative offset calculations */
+                uint8_t *method_entry_start = p;
+                Dwarf_Addr method_entry_addr = context.objc_methlist_addr + (method_entry_start - methlist_data);
+                
+                /* Read all three 32-bit fields */
+                uint32_t name_field = *(uint32_t*)(p + OBJC_METHOD_T_NAME_OFFSET);
+                /* types_field is at OBJC_METHOD_T_TYPES_OFFSET but we don't need it */
+                uint32_t imp_field = *(uint32_t*)(p + OBJC_METHOD_T_IMP_OFFSET);
+                
+                /* Advance pointer to next method entry before processing (in case we continue early) */
+                p += entsize;
+                
+                /* For "relative" method lists (entsize=12 on 64-bit), all offsets are signed
+                 * and relative to the field's own address, not the section base.
+                 * Structure: name_offset (relative), types_offset (relative), imp_offset (relative)
+                 */
+                
+                /* Calculate absolute address for name field */
+                int32_t signed_name_offset = (int32_t)name_field;
+                Dwarf_Addr name_field_addr = method_entry_addr + OBJC_METHOD_T_NAME_OFFSET;
+                Dwarf_Addr name_absolute_addr = name_field_addr + signed_name_offset;
+                
+                /* Calculate absolute address for imp field */
+                int32_t signed_imp_offset = (int32_t)imp_field;
+                Dwarf_Addr imp_field_addr = method_entry_addr + OBJC_METHOD_T_IMP_OFFSET;
+                imp_addr = imp_field_addr + signed_imp_offset;
+                
+                if (debug && i < OBJC_DEBUG_METHOD_DUMP_LIMIT) {
+                    fprintf(stderr, "Method %u: name_field_addr=0x%llx, signed_offset=%d, name_addr=0x%llx\n",
+                            i, (unsigned long long)name_field_addr, signed_name_offset, 
+                            (unsigned long long)name_absolute_addr);
+                    fprintf(stderr, "Method %u: imp_field_addr=0x%llx, signed_offset=%d, imp_addr=0x%llx\n",
+                            i, (unsigned long long)imp_field_addr, signed_imp_offset,
+                            (unsigned long long)imp_addr);
+                }
+                
+                /* Convert name_addr to method name */
+                /* name_absolute_addr might point to:
+                 * 1. Directly to a method name string in __objc_methname (unlikely in relative format)
+                 * 2. To a SEL in __objc_selrefs, which contains a pointer to the name in __objc_methname
+                 */
+                
+                if (name_absolute_addr >= context.objc_methname_addr && 
+                    name_absolute_addr < context.objc_methname_addr + context.objc_methname_size) {
+                    /* Direct pointer to method name in __objc_methname */
+                    name_offset = name_absolute_addr - context.objc_methname_addr;
+                    if (debug && i < OBJC_DEBUG_METHOD_DUMP_LIMIT)
+                        fprintf(stderr, "Method %u: Direct pointer to methname at offset 0x%llx\n",
+                                i, (unsigned long long)name_offset);
+                } else if (have_selrefs && 
+                          name_absolute_addr >= context.objc_selrefs_addr && 
+                          name_absolute_addr < context.objc_selrefs_addr + context.objc_selrefs_size) {
+                    /* Pointer to a SEL in __objc_selrefs - need to dereference it */
+                    Dwarf_Addr selref_offset = name_absolute_addr - context.objc_selrefs_addr;
+                    
+                    /* Read the SEL value (64-bit pointer on 64-bit architecture) */
+                    if (selref_offset + OBJC_SEL_POINTER_SIZE <= context.objc_selrefs_size) {
+                        uint64_t sel_ptr_raw = *(uint64_t*)(selrefs_data + selref_offset);
+                        
+                        /* On arm64e, pointers may have PAC (Pointer Authentication Code) in high bits */
+                        /* Mask off the high bits to get the actual pointer */
+                        /* Typically, only the low 48-52 bits are the actual address */
+                        uint64_t sel_ptr_masked = sel_ptr_raw & 0x0000FFFFFFFFFFFFULL; /* Keep low 48 bits */
+                        
+                        /* The masked pointer might be:
+                         * 1. An absolute address (if it's in the right range)
+                         * 2. A relative offset from __TEXT segment base
+                         */
+                        uint64_t sel_ptr;
+                        if (sel_ptr_masked >= context.intended_addr && sel_ptr_masked < context.intended_addr + OBJC_ADDRESS_RANGE_CHECK) {
+                            /* Looks like an absolute address */
+                            sel_ptr = sel_ptr_masked;
+                        } else {
+                            /* Treat as relative offset from __TEXT segment base */
+                            sel_ptr = context.intended_addr + sel_ptr_masked;
+                        }
+                        
+                        if (debug && i < OBJC_DEBUG_METHOD_DUMP_LIMIT) {
+                            fprintf(stderr, "Method %u: SEL at 0x%llx contains pointer 0x%llx (raw: 0x%llx, masked: 0x%llx)\n",
+                                    i, (unsigned long long)name_absolute_addr, 
+                                    (unsigned long long)sel_ptr, (unsigned long long)sel_ptr_raw,
+                                    (unsigned long long)sel_ptr_masked);
+                        }
+                        
+                        /* Check if sel_ptr points into __objc_methname */
+                        if (sel_ptr >= context.objc_methname_addr && 
+                            sel_ptr < context.objc_methname_addr + context.objc_methname_size) {
+                            name_offset = sel_ptr - context.objc_methname_addr;
+                            if (debug && i < OBJC_DEBUG_METHOD_DUMP_LIMIT)
+                                fprintf(stderr, "Method %u: SUCCESS - SEL dereferenced to methname offset 0x%llx\n",
+                                        i, (unsigned long long)name_offset);
+                        } else {
+                            /* SEL doesn't point to __objc_methname - skip this method */
+                            if (debug && i < OBJC_DEBUG_METHOD_DUMP_LIMIT)
+                                fprintf(stderr, "Method %u: SEL pointer 0x%llx doesn't point to methname section (addr=0x%llx, size=0x%llx)\n",
+                                        i, (unsigned long long)sel_ptr,
+                                        (unsigned long long)context.objc_methname_addr,
+                                        (unsigned long long)context.objc_methname_size);
+                            continue;
+                        }
+                    } else {
+                        if (debug && i < OBJC_DEBUG_METHOD_DUMP_LIMIT)
+                            fprintf(stderr, "Method %u: SEL offset 0x%llx out of bounds\n",
+                                    i, (unsigned long long)selref_offset);
+                        continue;
+                    }
+                } else {
+                    /* name_absolute_addr doesn't point to either section - skip this method */
+                    if (debug && i < OBJC_DEBUG_METHOD_DUMP_LIMIT)
+                        fprintf(stderr, "Method %u: name_addr 0x%llx doesn't point to valid section\n",
+                                i, (unsigned long long)name_absolute_addr);
+                    continue;
+                }
+                
+                if (debug && i < OBJC_DEBUG_METHOD_DUMP_LIMIT) {
+                    fprintf(stderr, "Method %u: name_offset=0x%llx, imp_addr=0x%llx, entsize=%u\n", 
+                            i, (unsigned long long)name_offset, (unsigned long long)imp_addr, entsize);
+                }
+            } else {
+                if (debug && i < OBJC_DEBUG_METHOD_DUMP_LIMIT)
+                    fprintf(stderr, "Skipping method %u: entsize=%u too small or out of bounds\n", i, entsize);
+                p += entsize;
+                continue;
+            }
+            
+            /* Get method name from __objc_methname section */
+            /* Check bounds - but allow slightly out-of-bounds to catch edge cases */
+            if (name_offset < context.objc_methname_size + OBJC_METHNAME_BOUNDS_TOLERANCE) {
+                /* Ensure we don't read past the end */
+                size_t safe_offset = (name_offset < context.objc_methname_size) ? name_offset : context.objc_methname_size - 1;
+                const char *method_name = (const char*)(methname_data + safe_offset);
+                
+                /* Validate that we have a valid null-terminated string */
+                size_t max_len = context.objc_methname_size - safe_offset;
+                if (max_len > 0 && method_name[0] != '\0') {
+                    /* Check if string is null-terminated within bounds */
+                    size_t len = strnlen(method_name, max_len);
+                    if (len < max_len && len > 0) {
+                        context.objc_methods[context.objc_method_count].name = strdup(method_name);
+                        context.objc_methods[context.objc_method_count].imp_addr = imp_addr;
+                        context.objc_method_count++;
+                        
+                        if (debug && i < OBJC_DEBUG_METHOD_OUTPUT_LIMIT) {
+                            fprintf(stderr, "  Method %u: %s -> imp: 0x%llx (name_offset=0x%llx)\n",
+                                    i, method_name, (unsigned long long)imp_addr, (unsigned long long)name_offset);
+                        }
+                    } else {
+                        if (debug && i < OBJC_DEBUG_METHOD_DUMP_LIMIT)
+                            fprintf(stderr, "Method %u: invalid method name at offset 0x%llx (empty or not null-terminated)\n", 
+                                    i, (unsigned long long)name_offset);
+                    }
+                } else {
+                    if (debug && i < OBJC_DEBUG_METHOD_DUMP_LIMIT)
+                        fprintf(stderr, "Method %u: name_offset 0x%llx out of bounds (size=0x%llx)\n", 
+                                i, (unsigned long long)name_offset, (unsigned long long)context.objc_methname_size);
+                }
+            } else {
+                if (debug && i < OBJC_DEBUG_METHOD_DUMP_LIMIT)
+                    fprintf(stderr, "Method %u: name_offset 0x%llx way out of bounds (size=0x%llx)\n", 
+                            i, (unsigned long long)name_offset, (unsigned long long)context.objc_methname_size);
+            }
+        }
+        
+        /* After parsing all methods in this list, check if we should continue */
+        /* Typically __objc_methlist contains only one method_list_t structure */
+        /* If we've parsed methods successfully, we can break here */
+        if (context.objc_method_count > 0) {
+            /* We've successfully parsed at least one method list */
+            /* Check if there's likely another method list after this one */
+            if (p + OBJC_METHOD_LIST_HEADER_SIZE > end || (p + OBJC_METHOD_LIST_HEADER_SIZE <= end && *(uint32_t*)p == 0)) {
+                /* No more data or next header looks invalid, stop parsing */
+                if (debug)
+                    fprintf(stderr, "Finished parsing method list, stopping (parsed %d methods)\n", 
+                            context.objc_method_count);
+                break;
+            }
+            /* Otherwise, continue to next method list */
+        }
+    }
+    
+    if (debug) {
+        fprintf(stderr, "Parsed %d Objective-C methods\n", context.objc_method_count);
+    }
+    
+    /* Sort methods by implementation address for efficient lookup */
+    if (context.objc_method_count > 0) {
+        qsort(context.objc_methods, context.objc_method_count, 
+              sizeof(struct objc_method_t), compare_objc_methods);
+    }
+    
+    if (selrefs_data)
+        free(selrefs_data);
+    free(methname_data);
+    free(methlist_data);
+    return 0;
+    
+cleanup:
+    if (selrefs_data)
+        free(selrefs_data);
+    free(methname_data);
+    free(methlist_data);
+    return -1;
+}
+
+/* Read and display Objective-C method names from __objc_methname section */
+void dump_objc_methname_section(int fd)
+{
+    if (context.objc_methname_size == 0 || context.objc_methname_offset == 0)
+        return;
+    
+    if (!debug)
+        return;
+    
+    char *methname_data = malloc(context.objc_methname_size);
+    if (!methname_data)
+        fatal("unable to allocate memory for objc_methname");
+    
+    off_t pos = lseek(fd, 0, SEEK_CUR);
+    if (pos < 0)
+        fatal("error seeking: %s", strerror(errno));
+    
+    int ret = lseek(fd, context.arch.offset + context.objc_methname_offset, SEEK_SET);
+    if (ret < 0)
+        fatal("error seeking to objc_methname: %s", strerror(errno));
+    
+    ret = _read(fd, methname_data, context.objc_methname_size);
+    if (ret < 0)
+        fatal_file(fd);
+    
+    ret = lseek(fd, pos, SEEK_SET);
+    if (ret < 0)
+        fatal("error seeking back: %s", strerror(errno));
+    
+    fprintf(stderr, "\n=== Objective-C Method Names (__objc_methname section) ===\n");
+    fprintf(stderr, "Section addr: 0x%llx, size: 0x%llx, offset: %llu\n",
+            (unsigned long long)context.objc_methname_addr,
+            (unsigned long long)context.objc_methname_size,
+            (unsigned long long)context.objc_methname_offset);
+    
+    /* Method names are null-terminated strings */
+    char *p = methname_data;
+    char *end = methname_data + context.objc_methname_size;
+    int count = 0;
+    
+    while (p < end) {
+        size_t len = strnlen(p, end - p);
+        if (len > 0 && len < (end - p)) {
+            fprintf(stderr, "  %s\n", p);
+            count++;
+            p += len + 1;
+        } else {
+            /* Skip null bytes */
+            if (*p == '\0') {
+                p++;
+            } else {
+                break;
+            }
+        }
+    }
+    
+    fprintf(stderr, "Total method names found: %d\n", count);
+    
+    free(methname_data);
+}
+
+/* Find Objective-C method for given address */
+static const struct objc_method_t *find_objc_method(Dwarf_Addr addr)
+{
+    if (context.objc_method_count == 0)
+        return NULL;
+    
+    /* Binary search for the method */
+    int left = 0;
+    int right = context.objc_method_count - 1;
+    const struct objc_method_t *best = NULL;
+    
+    while (left <= right) {
+        int mid = left + (right - left) / 2;
+        if (context.objc_methods[mid].imp_addr <= addr) {
+            best = &context.objc_methods[mid];
+            left = mid + 1;
+        } else {
+            right = mid - 1;
+        }
+    }
+    
+    /* Return the best match found by binary search */
+    /* Note: We don't verify offset ranges here because stripped binaries
+     * may have large offsets, and we want to symbolicate them correctly */
+    return best;
+}
+
 int  find_and_print_symtab_symbol(Dwarf_Addr slide, Dwarf_Addr addr)
 {
     union {
@@ -571,7 +1138,64 @@ int  find_and_print_symtab_symbol(Dwarf_Addr slide, Dwarf_Addr addr)
     int is_stab;
     uint8_t type;
 
+    /* Store original address for potential error output */
+    Dwarf_Addr original_addr = addr;
+
+    if (debug) {
+        fprintf(stderr, "\n=== Symbol Lookup Debug ===\n");
+        fprintf(stderr, "Raw address: 0x%llx\n", (unsigned long long)addr);
+        fprintf(stderr, "Slide: 0x%llx\n", (unsigned long long)slide);
+        fprintf(stderr, "Intended address: 0x%llx\n", (unsigned long long)context.intended_addr);
+        fprintf(stderr, "Load address: 0x%llx\n", (unsigned long long)options.load_address);
+    }
+
+    /* Check if original address is invalid (0) */
+    if (original_addr == 0) {
+        /* Invalid address - return no match so caller prints original address */
+        return DW_DLV_NO_ENTRY;
+    }
+
+    /* Check if address is too small before slide adjustment (would wrap around) */
+    if (original_addr < slide) {
+        /* Invalid address - return no match so caller prints original address */
+        return DW_DLV_NO_ENTRY;
+    }
+
     addr = addr - slide;
+    
+    /* Check if address is invalid after slide adjustment (too small) */
+    if (addr < context.intended_addr) {
+        /* Invalid address - return no match so caller prints original address */
+        return DW_DLV_NO_ENTRY;
+    }
+    
+    /* First, check if this address matches an Objective-C method */
+    const struct objc_method_t *objc_method = find_objc_method(addr);
+    if (objc_method) {
+        /* Validate that address is >= method implementation address */
+        if (addr >= objc_method->imp_addr) {
+            Dwarf_Addr offset = addr - objc_method->imp_addr;
+            printf("%s (in %s) + %llu\n",
+                    objc_method->name,
+                    basename((char *)options.dsym_filename),
+                    (unsigned long long)offset);
+            if (debug) {
+                fprintf(stderr, "=== Found Objective-C Method ===\n");
+                fprintf(stderr, "Method: %s\n", objc_method->name);
+                fprintf(stderr, "Implementation address: 0x%llx\n", 
+                        (unsigned long long)objc_method->imp_addr);
+                fprintf(stderr, "Search address: 0x%llx\n", (unsigned long long)addr);
+                fprintf(stderr, "Offset: %llu (0x%llx)\n", 
+                        (unsigned long long)offset, (unsigned long long)offset);
+            }
+            return 0;
+        }
+        /* If address is before method implementation, treat as no match and continue to symbol table lookup */
+    }
+    
+    if (debug) {
+        fprintf(stderr, "Adjusted address (after slide): 0x%llx\n", (unsigned long long)addr);
+    }
     current = context.symlist;
 
     for (i = 0; i < context.nsymbols; i++) {
@@ -581,6 +1205,8 @@ int  find_and_print_symtab_symbol(Dwarf_Addr slide, Dwarf_Addr addr)
 
         current->addr = context.is_64 ? nlist.nlist64.n_value : nlist.nlist32.n_value;
         type = context.is_64 ? nlist.nlist64.n_type : nlist.nlist32.n_type;
+        current->n_type = type;
+        current->n_sect = context.is_64 ? nlist.nlist64.n_sect : nlist.nlist32.n_sect;
         is_stab = type & N_STAB;
         if (debug) {
             fprintf(stderr, "\t\tname: %s\n", current->name);
@@ -621,23 +1247,164 @@ int  find_and_print_symtab_symbol(Dwarf_Addr slide, Dwarf_Addr addr)
     }
 
     qsort(context.symlist, context.nsymbols, sizeof(*current), compare_symbols);
-    current = context.symlist;
-
-    for (i = 0; i < context.nsymbols; i++) {
-        if (current->addr > addr) {
-            if (i < 1) {
-                /* Someone is asking about a symbol that comes before the first
-                 * one we know about. In that case we don't have a match for
-                 * them */
-                break;
+    
+    /* Debug: Print all valid section symbols (functions) with their addresses */
+    if (debug) {
+        fprintf(stderr, "\n=== All valid section symbols (functions) ===\n");
+        fprintf(stderr, "Search address: 0x%llx (after slide: 0x%llx)\n", 
+                (unsigned long long)(addr + slide), (unsigned long long)addr);
+        fprintf(stderr, "Total symbols: %d\n", context.nsymbols);
+        int valid_count = 0;
+        for (i = 0; i < context.nsymbols; i++) {
+            current = &context.symlist[i];
+            uint8_t sym_type = current->n_type & N_TYPE;
+            int is_stab = current->n_type & N_STAB;
+            
+            if (!is_stab && sym_type == N_SECT && current->n_sect != 0) {
+                valid_count++;
+                fprintf(stderr, "[%d] 0x%llx: %s (sect=%d, type=0x%02x)\n",
+                        valid_count,
+                        (unsigned long long)current->addr,
+                        current->name ? current->name : "(null)",
+                        current->n_sect,
+                        current->n_type);
             }
-
-            struct symbol_t *prev = (current - 1);
-            print_symbol(prev->name, (unsigned int)(addr - prev->addr));
-            found = 1;
-            break;
         }
-        current++;
+        fprintf(stderr, "Total valid section symbols: %d\n\n", valid_count);
+    }
+    
+    /* Use binary search to find the right symbol */
+    /* We want the symbol with the highest address that is <= our search address */
+    struct symbol_t *best_match = NULL;
+    Dwarf_Addr best_addr = 0;
+    
+    /* Binary search for the insertion point */
+    int left = 0;
+    int right = context.nsymbols - 1;
+    int pos = -1;
+    
+    while (left <= right) {
+        int mid = left + (right - left) / 2;
+        if (context.symlist[mid].addr <= addr) {
+            pos = mid;
+            left = mid + 1;
+        } else {
+            right = mid - 1;
+        }
+    }
+    
+    /* Now search backwards from pos to find the best valid symbol */
+    /* We want the closest valid section symbol that is <= our address */
+    if (pos >= 0) {
+        for (i = pos; i >= 0; i--) {
+            current = &context.symlist[i];
+            
+            /* Only consider section symbols (N_SECT), skip stabs and undefined symbols */
+            uint8_t sym_type = current->n_type & N_TYPE;
+            int is_stab = current->n_type & N_STAB;
+            
+            /* Skip if it's a stab, not a section symbol, or has invalid section */
+            if (is_stab || sym_type != N_SECT || current->n_sect == 0) {
+                continue;
+            }
+            
+            /* We know current->addr <= addr from binary search, so this is valid */
+            /* Take the first (highest address) valid symbol we find */
+            best_match = current;
+            best_addr = current->addr;
+            break; /* Found the best match, stop searching */
+        }
+    }
+    
+    if (best_match) {
+        /* Check if there's a next symbol to see the range */
+        Dwarf_Addr next_addr = 0;
+        int has_next = 0;
+        if (pos >= 0 && pos + 1 < context.nsymbols) {
+            for (i = pos + 1; i < context.nsymbols; i++) {
+                current = &context.symlist[i];
+                uint8_t sym_type = current->n_type & N_TYPE;
+                int is_stab = current->n_type & N_STAB;
+                if (!is_stab && sym_type == N_SECT && current->n_sect != 0) {
+                    next_addr = current->addr;
+                    has_next = 1;
+                    break;
+                }
+            }
+        }
+        
+        /* Check if the address is in a large gap that might contain Objective-C methods */
+        int might_be_objc_method = 0;
+        if (has_next && (next_addr - best_addr) > 0x1000) {
+            /* Large gap - might contain Objective-C methods */
+            might_be_objc_method = 1;
+        }
+        
+        if (debug) {
+            fprintf(stderr, "=== Symbol Match Result ===\n");
+            fprintf(stderr, "Found symbol: %s\n", best_match->name);
+            fprintf(stderr, "Symbol address: 0x%llx\n", (unsigned long long)best_addr);
+            if (has_next) {
+                fprintf(stderr, "Next symbol address: 0x%llx (gap: 0x%llx)\n",
+                        (unsigned long long)next_addr,
+                        (unsigned long long)(next_addr - best_addr));
+            }
+            fprintf(stderr, "Search address: 0x%llx (raw: 0x%llx)\n", 
+                    (unsigned long long)addr, (unsigned long long)(addr + slide));
+            fprintf(stderr, "Offset: %llu (0x%llx)\n", 
+                    (unsigned long long)(addr - best_addr),
+                    (unsigned long long)(addr - best_addr));
+            fprintf(stderr, "Section: %d, Type: 0x%02x\n", best_match->n_sect, best_match->n_type);
+            
+            /* Check if this might be an Objective-C method call */
+            if (context.objc_methname_size > 0) {
+                fprintf(stderr, "\nNOTE: Objective-C methods are not stored in the symbol table.\n");
+                fprintf(stderr, "The symbol table only contains C/C++ functions and class symbols.\n");
+                fprintf(stderr, "Objective-C method names are stored in __objc_methname section\n");
+                fprintf(stderr, "(addr=0x%llx, size=0x%llx).\n",
+                        (unsigned long long)context.objc_methname_addr,
+                        (unsigned long long)context.objc_methname_size);
+                if (might_be_objc_method) {
+                    fprintf(stderr, "\nWARNING: Large gap between symbols (0x%llx bytes).\n",
+                            (unsigned long long)(next_addr - best_addr));
+                    fprintf(stderr, "This address might be in an Objective-C method implementation.\n");
+                }
+            }
+        }
+        
+        
+        if (debug) {
+            /* Show nearby symbols for context */
+            fprintf(stderr, "\n=== Nearby symbols (for context) ===\n");
+            int start_idx = (pos > OBJC_DEBUG_NEARBY_SYMBOLS_WINDOW) ? pos - OBJC_DEBUG_NEARBY_SYMBOLS_WINDOW : 0;
+            int end_idx = (pos + OBJC_DEBUG_NEARBY_SYMBOLS_WINDOW < context.nsymbols) ? pos + OBJC_DEBUG_NEARBY_SYMBOLS_WINDOW : context.nsymbols - 1;
+            for (i = start_idx; i <= end_idx; i++) {
+                current = &context.symlist[i];
+                uint8_t sym_type = current->n_type & N_TYPE;
+                int is_stab = current->n_type & N_STAB;
+                const char *marker = (current == best_match) ? " <-- MATCH" : "";
+                
+                if (!is_stab && sym_type == N_SECT && current->n_sect != 0) {
+                    fprintf(stderr, "  0x%llx: %s%s\n",
+                            (unsigned long long)current->addr,
+                            current->name ? current->name : "(null)",
+                            marker);
+                }
+            }
+            fprintf(stderr, "\n");
+        }
+        print_symbol(best_match->name, (unsigned int)(addr - best_addr));
+        found = 1;
+    } else if (debug) {
+        fprintf(stderr, "=== No Symbol Match ===\n");
+        fprintf(stderr, "No matching symbol found for address 0x%llx (raw: 0x%llx)\n", 
+                (unsigned long long)addr, (unsigned long long)(addr + slide));
+        fprintf(stderr, "Searched %d symbols, binary search pos=%d\n", context.nsymbols, pos);
+        if (pos >= 0 && pos < context.nsymbols) {
+            fprintf(stderr, "Symbol at pos: 0x%llx (%s)\n",
+                    (unsigned long long)context.symlist[pos].addr,
+                    context.symlist[pos].name ? context.symlist[pos].name : "(null)");
+        }
     }
 
     return found ? DW_DLV_OK : DW_DLV_NO_ENTRY;
@@ -1127,6 +1894,11 @@ int print_dwarf_symbol(Dwarf_Debug dbg, Dwarf_Addr slide, Dwarf_Addr addr)
 }
 
 int main(int argc, char *argv[]) {
+    if (debug) {
+        fprintf(stderr, "=== ATOSL STARTING - VERSION WITH OBJC DEBUG ===\n");
+        fflush(stderr);
+    }
+    
     int fd;
     int ret;
     int i;
@@ -1266,8 +2038,34 @@ int main(int argc, char *argv[]) {
     if (argc <= optind)
         fatal_usage("no addresses specified");
 
+    if (debug) {
+        fprintf(stderr, "DEBUG: About to call dwarf_mach_object_access_init\n");
+        fflush(stderr);
+    }
+    
     dwarf_mach_object_access_init(fd, &binary_interface, &derr);
     assert(binary_interface);
+    
+    if (debug) {
+        fprintf(stderr, "DEBUG: After dwarf_mach_object_access_init\n");
+        fflush(stderr);
+    }
+    
+    /* Dump Objective-C method names if available and in debug mode */
+    if (debug && context.objc_methname_size > 0) {
+        fprintf(stderr, "\n=== CHECKING FOR OBJECTIVE-C METHOD NAMES ===\n");
+        fprintf(stderr, "objc_methname_size: 0x%llx\n", (unsigned long long)context.objc_methname_size);
+        fprintf(stderr, "objc_methname_offset: %llu\n", (unsigned long long)context.objc_methname_offset);
+        fprintf(stderr, "Calling dump_objc_methname_section...\n");
+        dump_objc_methname_section(fd);
+    }
+    
+    /* Parse Objective-C methods and sort by address for symbolication */
+    parse_objc_methods(fd);
+    if (debug && context.objc_method_count > 0) {
+        fprintf(stderr, "Loaded %d Objective-C methods for symbolication\n", 
+                context.objc_method_count);
+    }
 
     if (options.load_address == LONG_MAX)
         options.load_address = context.intended_addr;
@@ -1340,3 +2138,4 @@ int main(int argc, char *argv[]) {
 }
 
 /* vim:set ts=4 sw=4 sts=4 expandtab: */
+
